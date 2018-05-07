@@ -1,0 +1,1200 @@
+# loading required packages
+library(readr)
+library(dplyr)
+library(censusapi)
+library(tigris)
+library(rgdal)
+library(leaflet)
+library(mapview)
+library(plotly)
+
+# set census api key
+Sys.setenv(CENSUS_KEY="YOUR API KEY HERE")
+readRenviron("~/.Renviron")
+
+### TRAFFIC STOPS
+
+
+# loading stop data
+tstops <- read_csv("trafficStops_fpd_16.csv")
+
+# formatting time
+tstops <- tstops %>%
+  mutate(CONTACT_TIME = as.POSIXct(CONTACT_TIME, format="%m/%d/%y %H:%M"))
+
+
+# IDing stops made by the traffic unit and stops made by the patrol unit
+tstops_traffic <- tstops %>%
+  filter(is.na(EVENT_NUM)) %>%
+  mutate(unit="traffic")
+
+tstops_patrol <- anti_join(tstops,tstops_traffic)  %>%
+  mutate(unit="patrol") %>%
+  unique()
+
+# loading locations of stops made by the patrol unit and fixing dupes
+locations <- read_csv("trafficStops_locations_16.csv") %>%
+  unique()
+
+
+# joining the locations data onto tstops
+tstops_locations <- inner_join(tstops_patrol,locations, by=c("EVENT_NUM"="EVENT_NO"))
+
+
+# looking at stops by race
+stops_race <- tstops %>%
+  group_by(APPARENT_RACE) %>%
+  summarise(total_stops=n()) %>% 
+  arrange(desc(total_stops)) %>%
+  mutate(pc_stops = round(total_stops/sum (total_stops)*100,2))
+
+# grabbing census tract level demographic data
+ct <- getCensus(name = "acs5",
+                vintage = 2015,
+                vars = c("GEOID",
+                         "B01003_001E",
+                         "B03002_003E",
+                         "B03002_004E",
+                         "B03002_012E",
+                         "B03002_006E"),
+                region = "tract:*",
+                regionin = "state:06+county:019")
+
+names(ct) <- c("GEOID", "state", "county", "tract", "total_population","white_population", "black_population", "hispanic_population", "asian_population")
+
+ct <- ct %>%
+  mutate(pc_black_population = round(black_population/total_population*100,2),
+         pc_white_population = round(white_population/total_population*100,2),
+         pc_hispanic_population = round(hispanic_population/total_population*100,2),
+         pc_asian_population = round(asian_population/total_population*100,2))
+
+
+# fixing NaNs
+is.nan.data.frame <- function(x)
+  do.call(cbind, lapply(x, is.nan))
+ct[is.nan(ct)] <- 0
+
+# load TIGER/LINE shapefiles for census tracts in Fresno
+tracts_map <- tracts("06", county = "019")
+
+
+# joining demographic data to tracts shapefile
+tracts_merged <- geo_join(tracts_map,ct, "TRACTCE", "tract")
+
+
+# loading shape files for fresno police department districts 
+fpdBound_shape <- readOGR("pdbound.shp")
+
+
+# converting to long/lat projection 
+fpdBound_ll <- spTransform(fpdBound_shape, CRS('+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0'))
+
+# turning policing districts into lines
+fpdBound_lines <- as(fpdBound_ll, "SpatialLinesDataFrame")
+
+# clipping tracts map to police districts so that we're only looking at tracts within fpd jurisdiction
+fpd_tracts <- raster::intersect(tracts_merged,fpdBound_ll)
+
+
+## calculating and mapping total number of stops, searches and arrests in each census tract
+
+# grabbing only long/lat columns and turning each stop into a point
+stop_coords <- tstops_locations %>%
+  select(LONGT,LAT) %>%
+  filter(!is.na(LAT))
+
+# turning stops into spatial points
+stop_sp <- SpatialPoints(stop_coords)
+
+# applying same projection to the points as we're using with our map
+proj4string(stop_sp) <- "+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0"
+
+# now counting total number of stops in each tract 
+by_tract <- over(stop_sp, tracts_map)
+
+by_tract <- by_tract %>%
+  group_by(GEOID) %>%
+  summarise(total_stops=n()) %>%
+  mutate(pc_stops = round(total_stops/sum(total_stops)*100,2)) %>%
+  mutate(GEOID = as.character(GEOID)) %>%
+  filter(!is.na(GEOID))
+
+# calculating the above for searches
+search_locations <- tstops_locations %>%
+  filter(VEHICLE_SEARCHED=="Y")
+
+# grabbing only long/lat columns and turning each search into a point
+search_coords <- search_locations %>%
+  select(LONGT,LAT) %>%
+  filter(!is.na(LAT))
+
+# turning searches into spatial points
+search_sp <- SpatialPoints(search_coords)
+
+# applying same projection to the points as we're using with our map
+proj4string(search_sp) <- "+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0"
+
+# now counting total number of stops in each tract 
+by_tract_search <- over(search_sp, tracts_map)
+
+by_tract_search <- by_tract_search %>%
+  group_by(GEOID) %>%
+  summarise(total_searches=n()) %>%
+  mutate(pc_searches = round(total_searches/sum(total_searches)*100,2)) %>%
+  mutate(GEOID = as.character(GEOID)) %>%
+  filter(!is.na(GEOID))
+
+# joining with stop data
+by_tract <- left_join(by_tract, by_tract_search, by=c("GEOID"="GEOID"))
+
+
+# calculating the above for arrests
+arrest_locations <- tstops_locations %>%
+  filter(ACTION_TAKEN=="A")
+
+# grabbing only long/lat columns and turning each stop into a point
+arrest_coords <- arrest_locations %>%
+  select(LONGT,LAT) %>%
+  filter(!is.na(LAT))
+
+# turning searches into spatial points
+arrest_sp <- SpatialPoints(arrest_coords)
+
+# applying same projection to the points as we're using with our map
+proj4string(arrest_sp) <- "+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0"
+
+# now counting total number of stops in each tract 
+by_tract_arrest <- over(arrest_sp, tracts_map)
+
+by_tract_arrest <- by_tract_arrest %>%
+  group_by(GEOID) %>%
+  summarise(total_arrests=n()) %>%
+  mutate(pc_arrests = round(total_arrests/sum(total_arrests)*100,2)) %>%
+  mutate(GEOID = as.character(GEOID)) %>%
+  filter(!is.na(GEOID))
+
+# joining with stop data
+by_tract <- left_join(by_tract, by_tract_arrest, by=c("GEOID"="GEOID"))
+
+
+# joining with census data
+by_tract_join <- left_join(by_tract, tracts_merged@data, by=c("GEOID"="GEOID"))
+
+
+# turning data into a spatial polygon df to map in leaflet
+total_stops_map <- geo_join(fpd_tracts, by_tract,"GEOID","GEOID")
+
+## now, doing all the above — counting traffic stops in each tract and mapping — for stops of white, black and hispanic drivers, respectively
+
+# We only need the columns with the latitude and longitude
+race_stop_coords <- tstops_locations %>%
+  select(APPARENT_RACE,LONGT,LAT) %>%
+  filter(!is.na(LAT))
+
+# converting to spatial points, making sp for each race
+white_stop_sp <- race_stop_coords %>%
+  filter(APPARENT_RACE == "W") %>%
+  select(LONGT,LAT)
+
+white_stop_sp <- SpatialPoints(white_stop_sp)
+
+black_stop_sp <- race_stop_coords %>%
+  filter(APPARENT_RACE == "B") %>%
+  select(LONGT,LAT)
+
+black_stop_sp <- SpatialPoints(black_stop_sp)
+
+hispanic_stop_sp <- race_stop_coords %>%
+  filter(APPARENT_RACE == "H") %>%
+  select(LONGT,LAT)
+
+hispanic_stop_sp <- SpatialPoints(hispanic_stop_sp)
+
+asian_stop_sp <- race_stop_coords %>%
+  filter(APPARENT_RACE == "A") %>%
+  select(LONGT,LAT)
+
+asian_stop_sp <- SpatialPoints(asian_stop_sp)
+
+# applying same projection to the points as we're using with our map
+proj4string(white_stop_sp) <- "+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0"
+proj4string(black_stop_sp) <- "+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0"
+proj4string(hispanic_stop_sp) <- "+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0"
+proj4string(asian_stop_sp) <- "+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0"
+
+
+# calculating number of total stops of white drivers in each tract
+by_tract_white <- over(white_stop_sp, tracts_map)
+
+by_tract_white <- by_tract_white %>%
+  group_by(GEOID) %>%
+  summarise(total_white_stops=n()) %>%
+  mutate(GEOID = as.character(GEOID)) %>%
+  filter(!is.na(GEOID))
+
+
+# calculating percent of stops that were white in each tract
+by_tract_join <- left_join(by_tract_join, by_tract_white, by=c("GEOID"="GEOID"))
+
+by_tract_join <- by_tract_join %>%
+  mutate(pc_white_stops = round(total_white_stops/total_stops*100,2))
+
+
+# calculating points in a polygon: number of total stops of black drivers in each tract
+by_tract_black <- over(black_stop_sp, tracts_map)
+
+by_tract_black <- by_tract_black %>%
+  group_by(GEOID) %>%
+  summarise(total_black_stops=n()) %>%
+  mutate(GEOID = as.character(GEOID)) %>%
+  filter(!is.na(GEOID))
+
+
+# calculating percent of stops that were black in each tract
+by_tract_join <- left_join(by_tract_join, by_tract_black, by=c("GEOID"="GEOID"))
+
+by_tract_join <- by_tract_join %>%
+  mutate(pc_black_stops = round(total_black_stops/total_stops*100,2))
+
+
+# calculating points in a polygon: number of total stops of hispanic drivers in each tract
+by_tract_hispanic <- over(hispanic_stop_sp, tracts_map)
+
+by_tract_hispanic <- by_tract_hispanic %>%
+  group_by(GEOID) %>%
+  summarise(total_hispanic_stops=n()) %>%
+  mutate(GEOID = as.character(GEOID)) %>%
+  filter(!is.na(GEOID))
+
+
+# calculating percent of stops that were hispanic in each tract
+by_tract_join <- left_join(by_tract_join, by_tract_hispanic, by=c("GEOID"="GEOID"))
+
+by_tract_join <- by_tract_join %>%
+  mutate(pc_hispanic_stops = round(total_hispanic_stops/total_stops*100,2))
+
+
+## now making maps for % of traffic stops by race and population by race by census tracts
+
+# turning data into a spatial polygon df to map in Leaflet
+race_stop_map <- geo_join(fpd_tracts, by_tract_join,"GEOID","GEOID")
+
+### white
+
+# creating color pal and pop up for white pop map
+popup_white <- paste0("Census tract: ", race_stop_map$id, "<br>", "% of population that is white: ", race_stop_map$pc_white_population)
+pal_white <- colorNumeric(
+  palette = "Blues",
+  domain = c(0,100), na.color = "transparent"
+)
+
+# mapping white population 
+white_pop_map <- leaflet(options = leafletOptions(zoomControl = FALSE)) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data = race_stop_map, 
+              fillColor = ~pal_white(pc_white_population), 
+              color = "#b2aeae", 
+              fillOpacity = 0.7, 
+              weight = 0, 
+              smoothFactor = 0.2,
+              popup = popup_white) %>%
+  addPolylines(data = fpdBound_lines,
+               color = "#3b3b3b", weight = 1, smoothFactor = 0.5) %>%
+  leaflet::addLegend("bottomright", pal = pal_white, values = c(0,100),
+                     labFormat = labelFormat(suffix = "%"),
+                     opacity = 1
+  )
+
+print(white_pop_map)
+
+# saving map as html
+htmlwidgets :: saveWidget(white_pop_map, "white_pop_map.html", selfcontained = TRUE, libdir = NULL, background = "white")
+
+# saving screen shot of map for web juxtapose feature
+mapshot(white_pop_map, file = paste0(getwd(), "/white_pop_map.png"))
+
+# creating color pal and pop up for stops of white drivers
+popup_white_stops <- paste0("Census tract: ", race_stop_map$id, "<br>", "% of drivers stopped who were white: ", race_stop_map$pc_white_stops)
+pal_white_stops <- colorNumeric(
+  palette = "Blues",
+  domain = c(0,100), na.color = "transparent"
+)
+
+# mapping stops of white drivers
+
+white_stops_map <- leaflet(options = leafletOptions(zoomControl = FALSE)) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data = race_stop_map, 
+              fillColor = ~pal_white_stops(pc_white_stops), 
+              color = "#b2aeae", 
+              fillOpacity = 0.7, 
+              weight = 0, 
+              smoothFactor = 0.2,
+              popup = popup_white_stops) %>%
+  addPolylines(data = fpdBound_lines,
+               color = "#3b3b3b", weight = 1, smoothFactor = 0.5) %>%
+  leaflet::addLegend("bottomright", pal = pal_white_stops, values = c(0,100),
+                     labFormat = labelFormat(suffix = "%"),
+                     opacity = 1
+  )
+
+
+print(white_stops_map)
+
+# saving map as html
+htmlwidgets :: saveWidget(white_stops_map, "white_stops_map.html", selfcontained = TRUE, libdir = NULL, background = "white")
+
+# saving screen shot of map for web juxtapose feature
+mapshot(white_stops_map, file = paste0(getwd(), "/white_stops_map.png"))
+
+### black
+
+# creating color pal and pop up for black pop map
+popup_black <- paste0("Census tract: ", race_stop_map$id, "<br>", "% of population that is black: ", race_stop_map$pc_black_population)
+pal_black <- colorNumeric(
+  palette = "Greens",
+  domain = c(0,100), na.color = "transparent"
+)
+
+# mapping black population 
+black_pop_map <- leaflet(options = leafletOptions(zoomControl = FALSE)) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data = race_stop_map, 
+              fillColor = ~pal_black(pc_black_population), 
+              color = "#b2aeae",
+              fillOpacity = 0.7, 
+              weight = 0, 
+              smoothFactor = 0.2,
+              popup = popup_black) %>%
+  addPolylines(data = fpdBound_lines,
+               color = "#3b3b3b", weight = 1, smoothFactor = 0.5)  %>%
+  leaflet::addLegend("bottomright", pal = pal_black, values = c(0,100),
+                     labFormat = labelFormat(suffix = "%"),
+                     opacity = 1
+  )
+
+print(black_pop_map)
+
+# saving map as html
+htmlwidgets :: saveWidget(black_pop_map, "black_pop_map.html", selfcontained = TRUE, libdir = NULL, background = "white")
+
+# saving screen shot of map for web juxtapose feature
+mapshot(black_pop_map, file = paste0(getwd(), "/black_pop_map.png"))
+
+# creating color pal and pop up for black stops map
+popup_black_stops <- paste0("Census tract: ", race_stop_map$id, "<br>", "% of drivers stopped who were black: ", race_stop_map$pc_black_stops)
+pal_black_stops <- colorNumeric(
+  palette = "Greens",
+  domain = c(0,100), na.color = "transparent"
+)
+
+# mapping stops of black drivers
+black_stops_map <- leaflet(options = leafletOptions(zoomControl = FALSE)) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data = race_stop_map, 
+              fillColor = ~pal_black_stops(pc_black_stops), 
+              color = "#b2aeae",
+              fillOpacity = 0.7, 
+              weight = 0, 
+              smoothFactor = 0.2,
+              popup = popup_black_stops) %>%
+  addPolylines(data = fpdBound_lines,
+               color = "#3b3b3b", weight = 1, smoothFactor = 0.5) %>%
+  leaflet::addLegend("bottomright", pal = pal_black_stops, values = c(0,100),
+                     labFormat = labelFormat(suffix = "%"),
+                     opacity = 1
+  )
+
+print(black_stops_map)
+
+# saving map as html
+htmlwidgets :: saveWidget(black_stops_map, "black_stops_map.html", selfcontained = TRUE, libdir = NULL, background = "white")
+
+# saving screen shot of map for web juxtapose feature
+
+mapshot(black_stops_map, file = paste0(getwd(), "/black_stops_map.png"))
+
+### hispanic
+
+# creating color pal and pop up for hispanic pop map
+popup_hispanic <- paste0("Census tract: ", race_stop_map$id, "<br>", "% of population that is Hispanic: ", race_stop_map$pc_hispanic_population)
+pal_hispanic <- colorNumeric(
+  palette = "Oranges",
+  domain = c(0,100), na.color = "transparent"
+)
+
+# mapping Hispanic population 
+hispanic_pop_map <- leaflet(options = leafletOptions(zoomControl = FALSE)) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data = race_stop_map, 
+              fillColor = ~pal_hispanic(pc_hispanic_population), 
+              color = "#b2aeae", 
+              fillOpacity = 0.7, 
+              weight = 0, 
+              smoothFactor = 0.2,
+              popup = popup_hispanic) %>%
+  addPolylines(data = fpdBound_lines,
+               color = "#3b3b3b", weight = 1, smoothFactor = 0.5) %>%
+  leaflet::addLegend("bottomright", pal = pal_hispanic, values = c(0,100),
+                     labFormat = labelFormat(suffix = "%"),
+                     opacity = 1
+  )
+
+print(hispanic_pop_map)
+
+# saving map as html
+htmlwidgets :: saveWidget(hispanic_pop_map, "hispanic_pop_map.html", selfcontained = TRUE, libdir = NULL, background = "white")
+
+# saving screen shot of map for web juxtapose feature
+mapshot(hispanic_pop_map, file = paste0(getwd(), "/hispanic_pop_map.png"))
+
+
+# creating color pal and pop up for stops of Hispanic drivers
+popup_hispanic_stops <- paste0("Census tract: ", race_stop_map$id, "<br>", "% of drivers stopped who were Hispanic: ", race_stop_map$pc_hispanic_stops)
+pal_hispanic_stops <- colorNumeric(
+  palette = "Oranges",
+  domain = c(0,100), na.color = "transparent"
+)
+
+# mapping stops of Hispanic drivers
+
+hispanic_stops_map <- leaflet(options = leafletOptions(zoomControl = FALSE)) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data = race_stop_map, 
+              fillColor = ~pal_hispanic_stops(pc_hispanic_stops), 
+              color = "#b2aeae",
+              fillOpacity = 0.7, 
+              weight = 0, 
+              smoothFactor = 0.2,
+              popup = popup_hispanic_stops) %>%
+  addPolylines(data = fpdBound_lines,
+               color = "#3b3b3b", weight = 1, smoothFactor = 0.5) %>%
+  leaflet::addLegend("bottomright", pal = pal_hispanic_stops, values = c(0,100),
+                     labFormat = labelFormat(suffix = "%"),
+                     opacity = 1
+  )
+
+print(hispanic_stops_map)
+
+# saving map as html
+htmlwidgets :: saveWidget(hispanic_stops_map, "hispanic_stops_map.html", selfcontained = TRUE, libdir = NULL, background = "white")
+
+# saving screen shot of map for web juxtapose feature
+mapshot(hispanic_stops_map, file = paste0(getwd(), "/hispanic_stops_map.png"))
+
+
+
+# creating bar charts 
+
+# first getting stops by race in every fpd district
+
+by_district_stops <- over(stop_sp, fpdBound_ll)
+
+by_district_stops <- by_district_stops %>%
+  group_by(PD_AREA_NA) %>%
+  summarise(total_stops=n()) %>%
+  arrange(desc(total_stops))
+
+by_district_stops_white <- over(white_stop_sp, fpdBound_ll) 
+
+by_district_stops_white <- by_district_stops_white %>%
+  group_by(PD_AREA_NA) %>%
+  summarise(white_stops=n()) %>%
+  arrange(desc(white_stops))
+
+by_district_stops <- left_join(by_district_stops, by_district_stops_white)
+
+by_district_stops_black <- over(black_stop_sp, fpdBound_ll) 
+
+by_district_stops_black <- by_district_stops_black %>%
+  group_by(PD_AREA_NA) %>%
+  summarise(black_stops=n()) %>%
+  arrange(desc(black_stops))
+
+by_district_stops <- left_join(by_district_stops, by_district_stops_black)
+
+by_district_stops_hispanic <- over(hispanic_stop_sp, fpdBound_ll) 
+
+by_district_stops_hispanic <- by_district_stops_hispanic %>%
+  group_by(PD_AREA_NA) %>%
+  summarise(hispanic_stops=n()) %>%
+  arrange(desc(hispanic_stops))
+
+by_district_stops <- left_join(by_district_stops, by_district_stops_hispanic)
+
+by_district_stops_asian <- over(asian_stop_sp, fpdBound_ll) 
+
+by_district_stops_asian <- by_district_stops_asian %>%
+  group_by(PD_AREA_NA) %>%
+  summarise(asian_stops=n()) %>%
+  arrange(desc(asian_stops))
+
+by_district_stops <- left_join(by_district_stops, by_district_stops_asian)
+
+# dropping stops that happened outside the pd districts
+by_district_stops <- by_district_stops %>%
+  filter(!is.na(PD_AREA_NA))
+
+# now making a grouped bar chart for traffic stops by district
+
+# setting x axis order 
+
+xform <- list(categoryorder = "array",
+              categoryarray = c("SOUTHWEST", 
+                                "SOUTHEAST", 
+                                "CENTRAL",
+                                "NORTHWEST",
+                                "NORTHEAST"))
+
+district_race_chart <- plot_ly(by_district_stops, x = ~PD_AREA_NA, y = ~white_stops, type = 'bar', name = 'white stops', 
+                               marker = list(color = 'rgba(33,113,181,0.5)',
+                                             line = list(color = 'rgba(33,113,181,.1)',
+                                                         width = .7))) %>%
+  add_trace(y = ~hispanic_stops, name = 'hispanic stops',
+            marker = list(color = 'rgba(241,105,19,0.5)',
+                          line = list(color = 'rgba(241,105,19,1)',
+                                      width = .7))) %>%
+  add_trace(y = ~black_stops, name = 'black stops', 
+            marker = list(color = 'rgba(35,139,69,0.5)',
+                          line = list(color = 'rgba(35,139,69,1)',
+                                      width = .7))) %>%
+  add_trace(y = ~asian_stops, name = 'asian stops', 
+            marker = list(color = 'rgba(203,24,29,0.5)',
+                          line = list(color = 'rgba(203,24,29,1)',
+                                      width = .7))) %>%
+  layout(yaxis = list(title = 'Stops'), 
+         xaxis = list(title = 'Police District'), 
+         barmode = 'group') %>%
+  config(displayModeBar = FALSE) %>%
+  layout(xaxis = xform)
+
+print(district_race_chart)
+
+htmlwidgets :: saveWidget(district_race_chart, "district_race_chart.html", selfcontained = TRUE, libdir = NULL, background = "white")
+
+# making a bar chart for tstops and population 
+
+# joining driving age data to stop data
+driving_age <- read_csv("drivingAge_fresno.csv")
+
+# renaming variables, spelling out race names
+
+stops_race[1, "APPARENT_RACE"] <- "hispanic"
+stops_race[2, "APPARENT_RACE"] <- "white"
+stops_race[3, "APPARENT_RACE"] <- "black"
+stops_race[4, "APPARENT_RACE"] <- "other"
+stops_race[5, "APPARENT_RACE"] <- "asian"
+
+pop_stop <- left_join(driving_age, stops_race, by=c("race"="APPARENT_RACE"))
+
+# setting x axis order 
+xform2 <- list(categoryorder = "array",
+               categoryarray = c("white", 
+                                 "hispanic", 
+                                 "black",
+                                 "asian"))
+
+pop_stop_chart <-  plot_ly(pop_stop, x = ~race, y = ~pc_drivers, type = 'bar', name = '% of driving-age pop.', 
+                           marker = list(color = 'rgba(189,189,189,0.5)',
+                                         line = list(color = 'rgba(189,189,189,.1)',
+                                                     width = .7))) %>%
+  add_trace(y = ~pc_stops, name = '% of drivers stopped',
+            marker = list(color = 'rgba(37,37,37,0.5)',
+                          line = list(color = 'rgba(37,37,37,1)',
+                                      width = .7))) %>%
+  layout(yaxis = list(title = 'Percent'), 
+         xaxis = list(title = 'Race'), 
+         barmode = 'group') %>%
+  config(displayModeBar = FALSE) %>%
+  layout(xaxis = xform2)
+
+
+print(pop_stop_chart)
+
+# saving as html page
+htmlwidgets :: saveWidget(pop_stop_chart, "pop_stop_chart.html", selfcontained = TRUE, libdir = NULL, background = "white")
+
+
+# reading FPD incident data 
+fpd_crime <- read_csv("fpdIncidents_1118.csv")
+
+# looking at crime types
+crime_type <- fpd_crime %>%
+  group_by(incident_type_primary) %>%
+  summarise(count = n())
+
+
+# creating df for violent crimes, plus drug offenses and vice
+vc_drug <- c("CAD: ASSAULT", "CAD: WEAPONS OFFENSES", "CAD: ROBBERY", "RMS: ASSAULT/FIREARM", "RMS: ASSAULT/OTHER DANGEROUS WEAPON", 
+             "RMS: DV-ASSAULT/HANDS/FISTS/FEET/ETC-INJURY", "RMS: ROBB/STRONG ARM-HWY/ST/ALLEY/ETC", "RMS: ASSAULT/KNIFE/CUT INST",
+             "RMS: ROBB W/GUN-HWY/ST/ALLEY/ECT", "RMS: DV-ASSAULT/OTHER DANGEROUS WEAPON", "RMS: ASSAULT/HANDS/FISTS/FEET/ETC-INJURY",
+             "CAD: HOMICIDE", "RMS: DV-ASSAULT/KNIFE/CUT INST", "RMS: ROBB/STRONG ARM-COMMERCIAL HOUSE", "RMS: ROBB W/GUN-COMMERICAL HOUSE",
+             "RMS: ROBB W/KNIFE/CUT INST-HWY/ST/ALLEY/ETC", "RMS: ROBB/STRONG ARM-RESIDENTIAL", "RMS: ROBB W/GUN-RESIDENTIAL", 
+             "RMS: ROBB W/OTHER WEAP-HWY/ST/ALLEY/ETC", "RMS: MURDER & NON NEG HOMICIDE", "RMS: ROBB/STRONG ARM-MISC", "RMS: ROBB W/GUN-CONV-STORE",
+             "RMS: DV-ASSAULT/FIREARM", "RMS: ROBB W/KNIFE/CUT INST-COMMERCIAL HOUSE", "RMS: ROBB/STRONG ARM-CONV STORE", "RMS: ROBB W/GUN-MISC",
+             "RMS: ROBB W/OTHER WEAP-COMMERICAL HOUSE", "RMS: ROBB W/GUN-GAS/SERV STATION", "RMS: ROBB W/OTHER WEAP-MISC", "RMS: ROBB W/OTHER WEAP-RESIDENTIAL",
+             "RMS: ROBB W/KNIFE/CUT INST-CONV STORE", "RMS: ROBB W/KNIFE/CUT INST-MISC", "RMS: ROBB W/OTHER WEAP-CONV STORE", "RMS: ROBB/STRONG ARM-GAS/SERV STATION",
+             "RMS: ROBB W/KNIFE/CUT INST-RESIDENTIAL", "RMS: ROBB/STRONG ARM-BANK", "RMS: ROBB W/OTHER WEAP-GAS/SERV STATION", "RMS: ROBB W/GUN-BANK",
+             "RMS: ROBB W/KNIFE/CUT INST-GAS/SERV STATION", "RMS: ROBB W/KNIFE/CUT INST-BANK", "CAD: NARCOTICS", "CAD: VICE CRIMES")
+
+# creating dfs of only violent and drug crimes
+fpd_crime_vc_drug <- fpd_crime %>%
+  filter(incident_type_primary %in% vc_drug)
+
+
+# calculating vc+drug in each police district
+
+# We only need the columns with the latitude and longitude
+fpd_crime_vc_drug_coords <- fpd_crime_vc_drug[c("longitude", "latitude")]
+
+# Making sure we are working with rows that don't have any blanks
+fpd_crime_vc_drug_coords <- fpd_crime_vc_drug_coords[complete.cases(fpd_crime_vc_drug_coords),]
+
+# Letting R know that these are specifically spatial coordinates
+fpd_crime_vc_drug_sp <- SpatialPoints(fpd_crime_vc_drug_coords)
+
+# Applying projections to the coordinates so they match up with the shapefile we're joining them with
+# More projections information http://trac.osgeo.org/proj/wiki/GenParms 
+proj4string(fpd_crime_vc_drug_sp) <- "+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0"
+
+vc_drug_by_district <- over(fpd_crime_vc_drug_sp, fpdBound_ll)
+
+vc_drug_by_district <- vc_drug_by_district %>%
+  group_by(PD_AREA_NA) %>%
+  summarise(vc_drug_total=n()) %>%
+  arrange(desc(vc_drug_total))
+
+vc_drug_by_district <- vc_drug_by_district %>%
+  mutate(vc_drug_freq = vc_drug_total/sum(vc_drug_total)*100)
+
+
+# making charts for search and arrest rates by race
+
+# first, making a df for searches by race
+searches_race <- tstops %>%
+  filter(VEHICLE_SEARCHED == "Y") %>%
+  group_by(APPARENT_RACE) %>%
+  summarise(total_searches=n()) %>% 
+  arrange(desc(total_searches)) 
+
+# renaming variables, spelling out race names
+searches_race[1, "APPARENT_RACE"] <- "hispanic"
+searches_race[2, "APPARENT_RACE"] <- "black"
+searches_race[3, "APPARENT_RACE"] <- "white"
+searches_race[4, "APPARENT_RACE"] <- "asian"
+searches_race[5, "APPARENT_RACE"] <- "other"
+
+searches_race <- left_join(searches_race, stops_race)
+
+searches_race <- searches_race %>%
+  mutate(search_rate = round(total_searches/total_stops*1000,2))
+
+# dropping "other" searches
+searches_race <- searches_race %>%
+  filter(APPARENT_RACE != "other")
+
+# renaming race col
+names(searches_race)[1]<-"race"
+
+search_rate_chart <- plot_ly(searches_race, x = ~search_rate, y = ~race, type = 'bar',
+                             marker = list(color = 'rgba(37,37,37,0.5)',
+                                           line = list(color = 'rgba(37,37,37,1)',
+                                                       width = .7))) %>%
+  layout(xaxis = list(title = "Rate of car searches (per 1,000 traffic stops)"),
+         yaxis = list(title ="")) %>%
+  config(displayModeBar = FALSE)
+
+
+print(search_rate_chart)
+
+# saving as html page
+htmlwidgets :: saveWidget(search_rate_chart, "search_rate_chart.html", selfcontained = TRUE, libdir = NULL, background = "white")
+
+
+# now, making a df for arrests by race
+arrests_race <- tstops %>%
+  filter(ACTION_TAKEN == "A") %>%
+  group_by(APPARENT_RACE) %>%
+  summarise(total_arrests=n()) %>% 
+  arrange(desc(total_arrests)) 
+
+# renaming variables, spelling out race names
+arrests_race[1, "APPARENT_RACE"] <- "hispanic"
+arrests_race[2, "APPARENT_RACE"] <- "black"
+arrests_race[3, "APPARENT_RACE"] <- "white"
+arrests_race[4, "APPARENT_RACE"] <- "asian"
+arrests_race[5, "APPARENT_RACE"] <- "other"
+
+arrests_race <- left_join(arrests_race, stops_race)
+
+arrests_race <- arrests_race %>%
+  mutate(arrest_rate = round(total_arrests/total_stops*1000,2))
+
+# dropping "other" arrests
+arrests_race <- arrests_race %>%
+  filter(APPARENT_RACE != "other")
+
+# renaming race col
+names(arrests_race)[1]<-"race"
+
+arrest_rate_chart <- plot_ly(arrests_race, x = ~arrest_rate, y = ~race, type = 'bar',
+                             marker = list(color = 'rgba(37,37,37,0.5)',
+                                           line = list(color = 'rgba(37,37,37,1)',
+                                                       width = .7))) %>%
+  layout(xaxis = list(title = "Rate of drivers arrested (per 1,000 traffic stops)"),
+         yaxis = list(title ="")) %>%
+  config(displayModeBar = FALSE)
+
+
+print(arrest_rate_chart)
+
+# saving as html page
+htmlwidgets :: saveWidget(arrest_rate_chart, "arrest_rate_chart.html", selfcontained = TRUE, libdir = NULL, background = "white")
+
+
+
+
+### SCHOOL DISCIPLINE
+
+
+# loading 16-17 suspension data
+susp17 <- read_tsv("susp1617.txt")
+
+# loading other years of suspension data
+susp16 <- read_tsv("susp1516.txt")
+susp15 <- read_tsv("susp1415.txt")
+susp14 <- read_tsv("susp1314.txt")
+susp13 <- read_tsv("susp1213.txt")
+susp12 <- read_tsv("susp1112.txt")
+
+# binding years
+susp12_17 <- rbind(susp12,susp13,susp14,susp15,susp16,susp17)
+
+# converting character columns to numeric
+susp12_17$`Cumulative Enrollment` <- as.numeric(as.character(susp12_17$`Cumulative Enrollment`))
+susp12_17$`Total Suspensions` <- as.numeric(as.character(susp12_17$`Total Suspensions`))
+susp12_17$`Unduplicated Count of Students Suspended (Total)` <- as.numeric(as.character(susp12_17$`Unduplicated Count of Students Suspended (Total)`))
+susp12_17$`Unduplicated Count of Students Suspended (Defiance-Only)` <- as.numeric(as.character(susp12_17$`Unduplicated Count of Students Suspended (Defiance-Only)`))
+susp12_17$`Suspension Rate (Total)` <- as.numeric(as.character(susp12_17$`Suspension Rate (Total)`))
+susp12_17$`Suspension Count Violent Incident (Injury)` <- as.numeric(as.character(susp12_17$`Suspension Count Violent Incident (Injury)`))
+susp12_17$`Suspension Count Violent Incident (No Injury)` <- as.numeric(as.character(susp12_17$`Suspension Count Violent Incident (No Injury)`))
+susp12_17$`Suspension Count Weapons Possession` <- as.numeric(as.character(susp12_17$`Suspension Count Weapons Possession`))
+susp12_17$`Suspension Count Illicit Drug-Related` <- as.numeric(as.character(susp12_17$`Suspension Count Illicit Drug-Related`))
+susp12_17$`Suspension Count of Students Suspended (Defiance-Only)` <- as.numeric(as.character(susp12_17$`Suspension Count of Students Suspended (Defiance-Only)`))
+susp12_17$`Suspension Count Other Reasons` <- as.numeric(as.character(susp12_17$`Suspension Count Other Reasons`))
+
+# adding a column for suspensions per 100 students, another way of measuring suspension rate
+susp12_17 <- susp12_17 %>%
+  mutate(susp_per_100students = round(susp12_17$'Total Suspensions'/susp12_17$'Cumulative Enrollment'*100,2))
+
+# creating dfs for state and district levels
+suspState <- susp12_17 %>%
+  filter(`Aggregate Level`=="T")
+
+suspDistrict <- susp12_17 %>%
+  filter(`Aggregate Level`=="D1")
+
+#creating df for race at each aggregate level
+race <- c("RB","RI","RA","RF","RH","RD","RP","RT","RW")
+
+suspStateRace <- suspState %>%
+  filter(`Reporting Category` %in% race)
+
+suspDistrictRace <- suspDistrict %>%
+  filter(`Reporting Category` %in% race)
+
+#looking at suspension rates by race for Fresno and Clovis USDs
+suspDistrictRaceFresnoClovis <- suspDistrictRace %>%
+  filter(`District Name` %in% c("Fresno Unified","Clovis Unified"))
+
+#looking at suspension rates by race for Fresno USD only
+suspDistrictRaceFresno <- suspDistrictRace %>%
+  filter(`District Name` %in% c("Fresno Unified"))
+
+
+### doing the above for expulsion data
+
+# loading 16-17 expulsion data
+exp17 <- read_tsv("exp1617.txt")
+
+# loading other years of expulsion data
+exp16 <- read_tsv("exp1516.txt")
+exp15 <- read_tsv("exp1415.txt")
+exp14 <- read_tsv("exp1314.txt")
+exp13 <- read_tsv("exp1213.txt")
+exp12 <- read_tsv("exp1112.txt")
+
+exp12_17 <- rbind(exp12,exp13,exp14,exp15,exp16,exp17)
+
+# converting character columns to numeric
+exp12_17$`Cumulative Enrollment` <- as.numeric(as.character(exp12_17$`Cumulative Enrollment`))
+exp12_17$`Total Expulsions` <- as.numeric(as.character(exp12_17$`Total Expulsions`))
+exp12_17$`Unduplicated Count of Students Expelled (Total)` <- as.numeric(as.character(exp12_17$`Unduplicated Count of Students Expelled (Total)`))
+exp12_17$`Unduplicated Count of Students Expelled (Defiance-Only)` <- as.numeric(as.character(exp12_17$`Unduplicated Count of Students Expelled (Defiance-Only)`))
+exp12_17$`Expulsion Rate (Total)` <- as.numeric(as.character(exp12_17$`Expulsion Rate (Total)`))
+exp12_17$`Expulsion Count Violent Incident (Injury)` <- as.numeric(as.character(exp12_17$`Expulsion Count Violent Incident (Injury)`))
+exp12_17$`Expulsion Count Violent Incident (No Injury)` <- as.numeric(as.character(exp12_17$`Expulsion Count Violent Incident (No Injury)`))
+exp12_17$`Expulsion Count Weapons Possession` <- as.numeric(as.character(exp12_17$`Expulsion Count Weapons Possession`))
+exp12_17$`Expulsion Count Illicit Drug-Related` <- as.numeric(as.character(exp12_17$`Expulsion Count Illicit Drug-Related`))
+exp12_17$`Expulsion Count of Students Expelled (Defiance-Only)` <- as.numeric(as.character(exp12_17$`Expulsion Count of Students Expelled (Defiance-Only)`))
+exp12_17$`Expulsion Count Other Reasons` <- as.numeric(as.character(exp12_17$`Expulsion Count Other Reasons`))
+
+# adding a column for expulsions per 100 students, another way of measuring Expulsion rate
+exp12_17 <- exp12_17 %>%
+  mutate(exp_per_100students = round(exp12_17$'Total Expulsions'/exp12_17$'Cumulative Enrollment'*100,2))
+
+# creating dfs for state and district level
+expState <- exp12_17 %>%
+  filter(`Aggregate Level`=="T")
+
+expDistrict <- exp12_17 %>%
+  filter(`Aggregate Level`=="D1")
+
+
+# creating df for race at each aggregate level
+race <- c("RB","RI","RA","RF","RH","RD","RP","RT","RW")
+
+expStateRace <- expState %>%
+  filter(`Reporting Category` %in% race)
+
+expDistrictRace <- expDistrict %>%
+  filter(`Reporting Category` %in% race)
+
+
+# looking at expulsion rates by race for Fresno and Clovis USDs
+expDistrictRaceFresnoClovis <- expDistrictRace %>%
+  filter(`District Name` %in% c("Fresno Unified","Clovis Unified"))
+
+# looking at expulsion rates by race for Fresno USD only
+expDistrictRaceFresno <- expDistrictRace %>%
+  filter(`District Name` %in% c("Fresno Unified"))
+
+
+# isolating suspensions and expulsions by race for the most recent school year and largest districts
+
+district_50k <- c("Capistrano Unified", "Corona-Norco Unified", "Elk Grove Unified", "Fresno Unified", "Long Beach Unified", "Los Angeles Unified", "Oakland Unified", "San Bernardino City Unified", "San Diego Unified", "San Francisco Unified", "San Juan Unified", "Santa Ana Unified")
+
+susp17DistrictRace <- suspDistrictRace %>%
+  filter(`Academic Year` == "2016-17" & `District Name` %in% district_50k)
+
+exp17DistrictRace <- expDistrictRace %>%
+  filter(`Academic Year` == "2016-17" & `District Name` %in% district_50k)
+
+# looking at total suspension and expulsion rates by district
+
+suspDistrictTotal <- suspDistrict %>%
+  filter(`Reporting Category` == "TA")
+
+expDistrictTotal <- expDistrict %>%
+  filter(`Reporting Category` == "TA")
+
+# looking at same, for most recent year only and largest districts
+
+susp17DistrictTotal <- suspDistrict %>%
+  filter(`Reporting Category` == "TA" & `Academic Year` == "2016-17" & `Cumulative Enrollment` > 50000)
+
+exp17DistrictTotal <- expDistrict %>%
+  filter(`Reporting Category` == "TA" & `Academic Year` == "2016-17" & `Cumulative Enrollment` > 50000)
+
+
+# looking at change over time of suspensions and expulsions by race in the largest school districts
+suspLrgDistrictRace <- suspDistrictRace %>%
+  filter(`District Name` %in% district_50k)
+
+expLrgDistrictRace <- expDistrictRace %>%
+  filter(`District Name` %in% district_50k)
+
+# looking at suspension rates by race in FUSD
+
+suspFUSD <- suspDistrictRace %>%
+  filter(`District Name` == "Fresno Unified")
+
+suspFUSD <- suspFUSD %>%
+  filter(`Academic Year` == "2016-17")
+
+# filtering out students who are not black, white, asian, hispanic
+
+race_chart <- c("RB","RA","RH","RW")
+
+suspFUSD <- suspFUSD %>%
+  filter(`Reporting Category` %in% race_chart)
+
+# making chart for suspension rate by race for FUSD
+
+# renaming variables, spelling out race names
+suspFUSD[1, "Reporting Category"] <- "asian"
+suspFUSD[2, "Reporting Category"] <- "black"
+suspFUSD[3, "Reporting Category"] <- "hispanic"
+suspFUSD[4, "Reporting Category"] <- "white"
+
+names(suspFUSD)[10]<-"race"
+
+susp_rate_chart <- plot_ly(suspFUSD, x = ~susp_per_100students, y = ~race, type = 'bar',
+                           marker = list(color = 'rgba(37,37,37,0.5)',
+                                         line = list(color = 'rgba(37,37,37,1)',
+                                                     width = .7))) %>%
+  layout(xaxis = list(title = "Rate of suspensions (per 100 students)"),
+         yaxis = list(title =""))%>%
+  config(displayModeBar = FALSE)
+
+print(susp_rate_chart)
+
+# saving as html page
+htmlwidgets :: saveWidget(susp_rate_chart, "susp_rate_chart.html", selfcontained = TRUE, libdir = NULL, background = "white")
+
+
+### JAIL AND BAIL
+
+
+# load data
+booking <- read_csv("fresnoBooking1718_clean.csv") %>%
+  mutate(START_DATE = as.POSIXct(START_DATE, format = "%m/%d/%Y %I:%M:%S %p"),
+         END_DATE = as.POSIXct(END_DATE, format = "%m/%d/%Y %I:%M:%S %p"),
+         time_jailed2 = difftime(END_DATE,START_DATE, unit = "days"))
+
+glimpse(booking)
+
+# converting bail amounts to numeric that read in properly as characters
+booking$`bail 23` <- as.numeric(as.character(booking$`bail 23`))
+booking$`bail 24` <- as.numeric(as.character(booking$`bail 24`))
+booking$`bail 25` <- as.numeric(as.character(booking$`bail 25`))
+booking$`bail 26` <- as.numeric(as.character(booking$`bail 26`))
+booking$`bail 27` <- as.numeric(as.character(booking$`bail 27`))
+booking$`bail 28` <- as.numeric(as.character(booking$`bail 28`))
+booking$`bail 29` <- as.numeric(as.character(booking$`bail 29`))
+booking$`bail 30` <- as.numeric(as.character(booking$`bail 30`))
+booking$`bail 31` <- as.numeric(as.character(booking$`bail 31`))
+booking$`bail 32` <- as.numeric(as.character(booking$`bail 32`))
+booking$`bail 33` <- as.numeric(as.character(booking$`bail 33`))
+booking$`bail 34` <- as.numeric(as.character(booking$`bail 34`))
+booking$`bail 35` <- as.numeric(as.character(booking$`bail 35`))
+booking$`bail 36` <- as.numeric(as.character(booking$`bail 36`))
+
+
+# release types
+release_types <- booking %>%
+  group_by(RELEASE_TYPE) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(percent = round(count/sum(count)*100, 2))
+
+# zip codes 
+zip_codes <- booking %>%
+  group_by(ZIP) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count))
+
+# race
+race <- booking %>%
+  group_by(RACE) %>%
+  summarize(total_jailed = n()) %>%
+  arrange(desc(total_jailed)) %>%
+  mutate(pc_jailed = round(total_jailed/sum(total_jailed)*100,2))
+
+# release type by race
+release_race <- booking %>%
+  group_by(RELEASE_TYPE, RACE) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(percent = round(count/sum(count)*100,2))
+
+# mean and median time jailed by race
+time_race_mean <- booking %>%
+  group_by(RACE) %>%
+  summarize(mean_days_jailed = round(mean(time_jailed, na.rm = TRUE),2)) %>%
+  arrange(desc(mean_days_jailed))
+
+time_race_median <- booking %>%
+  group_by(RACE) %>%
+  summarize(median_days_jailed = round(median(time_jailed, na.rm = TRUE),2)) %>%
+  arrange(desc(median_days_jailed))
+
+# create columns for felonies and misdemeanors
+booking <- booking %>%
+  mutate(charges_1_m = ifelse(grepl("\\[M\\]", `charges 1_clean`)==TRUE,1,0),
+         charges_1_f = ifelse(grepl("\\[F\\]", `charges 1_clean`)==TRUE,1,0),
+         charges_2_m = ifelse(grepl("\\[M\\]", `charges 2_clean`)==TRUE,1,0),
+         charges_2_f = ifelse(grepl("\\[F\\]", `charges 2_clean`)==TRUE,1,0),
+         charges_3_m = ifelse(grepl("\\[M\\]", `charges 3_clean`)==TRUE,1,0),
+         charges_3_f = ifelse(grepl("\\[F\\]", `charges 3_clean`)==TRUE,1,0),
+         charges_4_m = ifelse(grepl("\\[M\\]", `charges 4_clean`)==TRUE,1,0),
+         charges_4_f = ifelse(grepl("\\[F\\]", `charges 4_clean`)==TRUE,1,0),
+         charges_5_m = ifelse(grepl("\\[M\\]", `charges 5_clean`)==TRUE,1,0),
+         charges_5_f = ifelse(grepl("\\[F\\]", `charges 5_clean`)==TRUE,1,0),
+         charges_6_m = ifelse(grepl("\\[M\\]", `charges 6_clean`)==TRUE,1,0),
+         charges_6_f = ifelse(grepl("\\[F\\]", `charges 6_clean`)==TRUE,1,0),
+         charges_7_m = ifelse(grepl("\\[M\\]", `charges 7_clean`)==TRUE,1,0),
+         charges_7_f = ifelse(grepl("\\[F\\]", `charges 7_clean`)==TRUE,1,0),
+         charges_8_m = ifelse(grepl("\\[M\\]", `charges 8_clean`)==TRUE,1,0),
+         charges_8_f = ifelse(grepl("\\[F\\]", `charges 8_clean`)==TRUE,1,0),
+         charges_9_m = ifelse(grepl("\\[M\\]", `charges 9_clean`)==TRUE,1,0),
+         charges_9_f = ifelse(grepl("\\[F\\]", `charges 9_clean`)==TRUE,1,0),
+         charges_10_m = ifelse(grepl("\\[M\\]", `charges 10_clean`)==TRUE,1,0),
+         charges_10_f = ifelse(grepl("\\[F\\]", `charges 10_clean`)==TRUE,1,0),
+         charges_11_m = ifelse(grepl("\\[M\\]", `charges 11_clean`)==TRUE,1,0),
+         charges_11_f = ifelse(grepl("\\[F\\]", `charges 11_clean`)==TRUE,1,0),
+         charges_12_m = ifelse(grepl("\\[M\\]", `charges 12_clean`)==TRUE,1,0),
+         charges_12_f = ifelse(grepl("\\[F\\]", `charges 12_clean`)==TRUE,1,0),
+         charges_13_m = ifelse(grepl("\\[M\\]", `charges 13_clean`)==TRUE,1,0),
+         charges_13_f = ifelse(grepl("\\[F\\]", `charges 13_clean`)==TRUE,1,0),
+         charges_14_m = ifelse(grepl("\\[M\\]", `charges 14_clean`)==TRUE,1,0),
+         charges_14_f = ifelse(grepl("\\[F\\]", `charges 14_clean`)==TRUE,1,0),
+         charges_15_m = ifelse(grepl("\\[M\\]", `charges 15_clean`)==TRUE,1,0),
+         charges_15_f = ifelse(grepl("\\[F\\]", `charges 15_clean`)==TRUE,1,0),
+         charges_16_m = ifelse(grepl("\\[M\\]", `charges 16_clean`)==TRUE,1,0),
+         charges_16_f = ifelse(grepl("\\[F\\]", `charges 16_clean`)==TRUE,1,0),
+         charges_17_m = ifelse(grepl("\\[M\\]", `charges 17_clean`)==TRUE,1,0),
+         charges_17_f = ifelse(grepl("\\[F\\]", `charges 17_clean`)==TRUE,1,0),
+         charges_18_m = ifelse(grepl("\\[M\\]", `charges 18_clean`)==TRUE,1,0),
+         charges_18_f = ifelse(grepl("\\[F\\]", `charges 18_clean`)==TRUE,1,0),
+         charges_19_m = ifelse(grepl("\\[M\\]", `charges 19_clean`)==TRUE,1,0),
+         charges_19_f = ifelse(grepl("\\[F\\]", `charges 19_clean`)==TRUE,1,0),
+         charges_20_m = ifelse(grepl("\\[M\\]", `charges 20_clean`)==TRUE,1,0),
+         charges_20_f = ifelse(grepl("\\[F\\]", `charges 20_clean`)==TRUE,1,0),
+         charges_21_m = ifelse(grepl("\\[M\\]", `charges 21_clean`)==TRUE,1,0),
+         charges_21_f = ifelse(grepl("\\[F\\]", `charges 21_clean`)==TRUE,1,0),
+         charges_22_m = ifelse(grepl("\\[M\\]", `charges 22_clean`)==TRUE,1,0),
+         charges_22_f = ifelse(grepl("\\[F\\]", `charges 22_clean`)==TRUE,1,0),
+         charges_23_m = ifelse(grepl("\\[M\\]", `charges 23_clean`)==TRUE,1,0),
+         charges_23_f = ifelse(grepl("\\[F\\]", `charges 23_clean`)==TRUE,1,0),
+         charges_24_m = ifelse(grepl("\\[M\\]", `charges 24_clean`)==TRUE,1,0),
+         charges_24_f = ifelse(grepl("\\[F\\]", `charges 24_clean`)==TRUE,1,0),
+         charges_25_m = ifelse(grepl("\\[M\\]", `charges 25_clean`)==TRUE,1,0),
+         charges_25_f = ifelse(grepl("\\[F\\]", `charges 25_clean`)==TRUE,1,0),
+         charges_26_m = ifelse(grepl("\\[M\\]", `charges 26_clean`)==TRUE,1,0),
+         charges_26_f = ifelse(grepl("\\[F\\]", `charges 26_clean`)==TRUE,1,0),
+         charges_27_m = ifelse(grepl("\\[M\\]", `charges 27_clean`)==TRUE,1,0),
+         charges_27_f = ifelse(grepl("\\[F\\]", `charges 27_clean`)==TRUE,1,0),
+         charges_28_m = ifelse(grepl("\\[M\\]", `charges 28_clean`)==TRUE,1,0),
+         charges_28_f = ifelse(grepl("\\[F\\]", `charges 28_clean`)==TRUE,1,0),
+         charges_29_m = ifelse(grepl("\\[M\\]", `charges 29_clean`)==TRUE,1,0),
+         charges_29_f = ifelse(grepl("\\[F\\]", `charges 29_clean`)==TRUE,1,0),
+         charges_30_m = ifelse(grepl("\\[M\\]", `charges 30_clean`)==TRUE,1,0),
+         charges_30_f = ifelse(grepl("\\[F\\]", `charges 30_clean`)==TRUE,1,0),
+         charges_31_m = ifelse(grepl("\\[M\\]", `charges 31_clean`)==TRUE,1,0),
+         charges_31_f = ifelse(grepl("\\[F\\]", `charges 31_clean`)==TRUE,1,0),
+         charges_32_m = ifelse(grepl("\\[M\\]", `charges 32_clean`)==TRUE,1,0),
+         charges_32_f = ifelse(grepl("\\[F\\]", `charges 32_clean`)==TRUE,1,0),
+         charges_33_m = ifelse(grepl("\\[M\\]", `charges 33_clean`)==TRUE,1,0),
+         charges_33_f = ifelse(grepl("\\[F\\]", `charges 33_clean`)==TRUE,1,0),
+         charges_34_m = ifelse(grepl("\\[M\\]", `charges 34_clean`)==TRUE,1,0),
+         charges_34_f = ifelse(grepl("\\[F\\]", `charges 34_clean`)==TRUE,1,0),
+         charges_35_m = ifelse(grepl("\\[M\\]", `charges 35_clean`)==TRUE,1,0),
+         charges_35_f = ifelse(grepl("\\[F\\]", `charges 35_clean`)==TRUE,1,0),
+         charges_36_m = ifelse(grepl("\\[M\\]", `charges 36_clean`)==TRUE,1,0),
+         charges_36_f = ifelse(grepl("\\[F\\]", `charges 36_clean`)==TRUE,1,0))
+
+# create columns for total misdemeanors and felonies
+booking <- booking %>%
+  mutate(total_m = charges_1_m + charges_2_m + charges_3_m + charges_4_m + charges_5_m +
+           charges_6_m + charges_7_m + charges_8_m + charges_9_m + charges_10_m +
+           charges_11_m + charges_12_m + charges_13_m + charges_14_m + charges_15_m +
+           charges_16_m + charges_17_m + charges_18_m + charges_19_m + charges_20_m +
+           charges_21_m + charges_22_m + charges_23_m + charges_24_m + charges_25_m +
+           charges_26_m + charges_27_m + charges_28_m + charges_29_m + charges_30_m +
+           charges_31_m + charges_32_m + charges_33_m + charges_34_m + charges_35_m +
+           charges_36_m,
+         total_f = charges_1_f + charges_2_f + charges_3_f + charges_4_f + charges_5_f +
+           charges_6_f + charges_7_f + charges_8_f + charges_9_f + charges_10_f +
+           charges_11_f + charges_12_f + charges_13_f + charges_14_f + charges_15_f +
+           charges_16_f + charges_17_f + charges_18_f + charges_19_f + charges_20_f +
+           charges_21_f + charges_22_f + charges_23_f + charges_24_f + charges_25_f +
+           charges_26_f + charges_27_f + charges_28_f + charges_29_f + charges_30_f +
+           charges_31_f + charges_32_f + charges_33_f + charges_34_f + charges_35_f +
+           charges_36_f)
+
+# create columns for total bail
+booking <- booking %>%
+  mutate(total_bail = rowSums(select(., contains("bail")), na.rm = TRUE))
+
+
+# creating a factor variable for race in order to run a linear regression
+booking$race.f <- factor(booking$RACE)
+is.factor(booking$race.f)
+
+# reordering factors
+booking$race.f = factor(booking$race.f,levels(booking$race.f)[c(6,3,4,2,1,5)])
+
+# distribution of total bail
+hist_total_bail <- ggplot(booking, aes(x=total_bail)) + geom_histogram()
+
+plot(hist_total_bail)
+
+# bail, our outcome variable, is highly skewed, so let's going to perform a transformation on the bail column and then drop the infinites values we've created
+booking <- booking %>%
+  mutate(total_bail_transform = log10(total_bail))
+
+booking$total_bail_transform[which(is.infinite(booking$total_bail_transform))] = NA
+
+# now, looking at distribution of transformed variable
+hist_total_bail_transform <- ggplot(booking, aes(x=total_bail_transform)) + geom_histogram()
+
+plot(hist_total_bail_transform)
+
+# filter out those who weren't given bail
+booking <- booking %>%
+  mutate(no_bail = ifelse(grepl("NO BAIL", CHARGES)==TRUE,"NO BAIL","BAILABLE"))
+
+booking_bailable <- booking %>%
+  filter(no_bail == "BAILABLE")
+
+
+# multiple linear regression 
+fit <- lm(total_bail_transform ~ race.f + total_m + total_f + AGE, data=booking_bailable)
+summary(fit)
+
+
+# now creating a training and test data set to test my model
+train_idx <- sample(1:nrow(booking_bailable),10991,replace=FALSE)
+booking_bailable_training <- booking_bailable[train_idx,] # selecting all these rows
+booking_bailable_test <- booking_bailable[-train_idx,] # selecting all but these rows
+
+# testing fit on training and test data
+fit_training <- lm(total_bail_transform ~ race.f + total_m + total_f + AGE, data=booking_bailable_training)
+summary(fit_training)
+
+fit_test <- lm(total_bail_transform ~ race.f + total_m + total_f + AGE, data=booking_bailable_test)
+summary(fit_test)
+
+# making bar chart for jail pop v county pop
+
+# joining county demographic data to stop data
+county_pop <- read_csv("demographics_fresnoCounty.csv")
+
+# renaming variables, spelling race names lower case
+race[1, "RACE"] <- "hispanic"
+race[2, "RACE"] <- "white"
+race[3, "RACE"] <- "black"
+race[4, "RACE"] <- "asian"
+
+pop_jail <- left_join(county_pop, race, by=c("race"="RACE"))
+
+# setting x axis order 
+xform <- list(categoryorder = "array",
+              categoryarray = c("white", 
+                                "hispanic", 
+                                "black",
+                                "asian"))
+
+pop_jail_chart <-  plot_ly(pop_jail, x = ~race, y = ~pc_county_pop, type = 'bar', name = '% of county pop.', 
+                           marker = list(color = 'rgba(189,189,189,0.5)',
+                                         line = list(color = 'rgba(189,189,189,.1)',
+                                                     width = .7))) %>%
+  add_trace(y = ~pc_jailed, name = '% of jail pop.',
+            marker = list(color = 'rgba(37,37,37,0.5)',
+                          line = list(color = 'rgba(37,37,37,1)',
+                                      width = .7))) %>%
+  layout(yaxis = list(title = 'Percent'), 
+         xaxis = list(title = 'Race'), 
+         barmode = 'group') %>%
+  config(displayModeBar = FALSE) %>%
+  layout(xaxis = xform)
+
+
+print(pop_jail_chart)
+
+# saving as html page
+htmlwidgets :: saveWidget(pop_jail_chart, "pop_jail_chart.html", selfcontained = TRUE, libdir = NULL, background = "white")
+
+
+
