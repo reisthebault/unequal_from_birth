@@ -128,7 +128,7 @@ htmlwidgets :: saveWidget(pop_stop_chart, "pop_stop_chart.html", selfcontained =
 
 
 ```
-<iframe src="data/pop_stop_chart.html"
+<iframe src="pop_stop_chart.html"
         height="600" width="100%"
         scrolling="no" seamless="seamless"
         frameBorder="0">
@@ -706,7 +706,7 @@ htmlwidgets :: saveWidget(district_race_chart, "district_race_chart.html", selfc
 
 ```
 
-<iframe src="data/district_race_chart.html"
+<iframe src="district_race_chart.html"
         height="600" width="100%"
         scrolling="no" seamless="seamless"
         frameBorder="0">
@@ -821,7 +821,7 @@ print(search_rate_chart)
 # saving as html page
 htmlwidgets :: saveWidget(search_rate_chart, "search_rate_chart.html", selfcontained = TRUE, libdir = NULL, background = "white")
 ```
-<iframe src="data/search_rate_chart.html"
+<iframe src="search_rate_chart.html"
         height="600" width="100%"
         scrolling="no" seamless="seamless"
         frameBorder="0">
@@ -870,7 +870,7 @@ print(arrest_rate_chart)
 htmlwidgets :: saveWidget(arrest_rate_chart, "arrest_rate_chart.html", selfcontained = TRUE, libdir = NULL, background = "white")
 
 ```
-<iframe src="data/arrest_rate_chart.html"
+<iframe src="arrest_rate_chart.html"
         height="600" width="100%"
         scrolling="no" seamless="seamless"
         frameBorder="0">
@@ -1065,7 +1065,7 @@ print(susp_rate_chart)
 htmlwidgets :: saveWidget(susp_rate_chart, "susp_rate_chart.html", selfcontained = TRUE, libdir = NULL, background = "white")
 
 ```
-<iframe src="data/susp_rate_chart.html"
+<iframe src="susp_rate_chart.html"
         height="600" width="100%"
         scrolling="no" seamless="seamless"
         frameBorder="0">
@@ -1390,7 +1390,7 @@ print(pop_jail_chart)
 htmlwidgets :: saveWidget(pop_jail_chart, "pop_jail_chart.html", selfcontained = TRUE, libdir = NULL, background = "white")
 
 ```
-<iframe src="data/pop_jail_chart.html"
+<iframe src="pop_jail_chart.html"
         height="600" width="100%"
         scrolling="no" seamless="seamless"
         frameBorder="0">
