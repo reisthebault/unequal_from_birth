@@ -9,7 +9,7 @@ This analysis supports a data-driven examination of inequalities throughout the 
 
 ### Data
 
-This story relies on data spanning the justice system, from city, county and state sources. We obtained data on every traffic stop that the Fresno Police Department made in 2016 through a request made under the California Public Records Act. We obtained jail booking and release data — that is, people who are locked up in and who are released from the jail – from Jan. 2017 to Feb. 2018 through another request made under the CPRA. Finally, we downloaded school suspension and expulsion data for the last five school years from the California Department of Education and local demographic data from the U.S. Census Bureau.
+This story relies on data spanning the justice system, from city, county and state sources. We obtained data on every traffic stop that the Fresno Police Department made in 2016 through a request made under the California Public Records Act. We obtained jail booking and release data — that is, people who are locked up in and who are released from the jail – from Jan. 2017 to Feb. 2018 through another request made under the CPRA. Finally, we downloaded school suspension and expulsion data for the last five school years from the California Department of Education and local demographic data from the U.S. Census Bureau. We used the following [R](https://www.r-project.org/) code in our analysis.
 
 ### Setting up
 
@@ -1398,5 +1398,5 @@ htmlwidgets :: saveWidget(pop_jail_chart, "pop_jail_chart.html", selfcontained =
 
 ## **Acknowledgments**
 
-Thank you to [Peter Aldhous](https://twitter.com/paldhous) for advice on this analysis and help with the code — both in and out of his classes — and to [Jeremy Rue](https://twitter.com/jrue) for help on the project's website and for making these charts look pretty on it. 
+Thank you to [Peter Aldhous](https://twitter.com/paldhous) for advice on this analysis and help with the code — both in and out of his classes — and to [Jeremy Rue](https://twitter.com/jrue) for help making these charts clear and effective.
 
